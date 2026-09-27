@@ -1,0 +1,418 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CRC Vision — Lesion Detection &amp; Cancer Grading</title>
+<meta name="description" content="Private, in-browser estimator for colorectal endoscopy lesions and histology grade (G1/G2/G3).">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<script>
+(function(){var t=null;try{t=localStorage.getItem('crc-theme')}catch(e){}
+if(t!=='dark'&&t!=='light'){var a=document.documentElement.getAttribute('data-theme');t=(a==='dark'||a==='light')?a:(window.matchMedia&&matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light')}
+document.documentElement.classList.toggle('dark',t==='dark');document.documentElement.setAttribute('data-theme',t)})();
+</script>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['"Plus Jakarta Sans"','ui-sans-serif','system-ui','-apple-system','Segoe UI','sans-serif']}}}}</script>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+html{scroll-padding-top:env(safe-area-inset-top,0px);color-scheme:light}html.dark{color-scheme:dark}
+body{margin:0;font-family:"Plus Jakarta Sans",ui-sans-serif,system-ui,sans-serif;background:#f8fafc}html.dark body{background:#020617}
+@keyframes scan{0%{top:-35%}100%{top:100%}}.scanline{animation:scan 1.4s ease-in-out infinite}
+@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}.fade-up{animation:fadeUp .5s ease both}
+@media (prefers-reduced-motion:reduce){.scanline,.fade-up{animation:none}*{transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<noscript><p style="padding:2rem;text-align:center">CRC Vision needs JavaScript enabled.</p></noscript>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/htm@3.1.1/dist/htm.umd.js"></script>
+<script>
+(function(){
+/* ================= Analysis engine ================= */
+const clamp=(v,a=0,b=1)=>Math.max(a,Math.min(b,v));
+let imgEl=null;
+/* ---------- image helpers ---------- */
+function getPixels(img,maxW=256){
+  const s=Math.min(1,maxW/img.naturalWidth),w=Math.max(16,Math.round(img.naturalWidth*s)),h=Math.max(16,Math.round(img.naturalHeight*s));
+  const c=document.createElement('canvas');c.width=w;c.height=h;const x=c.getContext('2d');x.drawImage(img,0,0,w,h);
+  const d=x.getImageData(0,0,w,h).data,N=w*h,R=new Float32Array(N),G=new Float32Array(N),B=new Float32Array(N),L=new Float32Array(N);
+  for(let i=0;i<N;i++){R[i]=d[i*4];G[i]=d[i*4+1];B[i]=d[i*4+2];L[i]=.299*R[i]+.587*G[i]+.114*B[i]}
+  return{w,h,N,R,G,B,L,scale:img.naturalWidth/w};
+}
+function blur(a,w,h,r){const t=new Float32Array(a.length),o=new Float32Array(a.length);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){let s=0,c=0;for(let k=-r;k<=r;k++){const xx=x+k;if(xx>=0&&xx<w){s+=a[y*w+xx];c++}}t[y*w+x]=s/c}
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){let s=0,c=0;for(let k=-r;k<=r;k++){const yy=y+k;if(yy>=0&&yy<h){s+=t[yy*w+x];c++}}o[y*w+x]=s/c}
+  return o}
+function otsu(a,valid){let mn=1e9,mx=-1e9,n=0;for(let i=0;i<a.length;i++)if(valid[i]){mn=Math.min(mn,a[i]);mx=Math.max(mx,a[i])}
+  const B=64,hist=new Float64Array(B);for(let i=0;i<a.length;i++)if(valid[i]){hist[Math.min(B-1,((a[i]-mn)/(mx-mn+1e-9)*B)|0)]++;n++}
+  let sum=0;for(let k=0;k<B;k++)sum+=k*hist[k];let wB=0,sB=0,best=0,bt=0;
+  for(let k=0;k<B;k++){wB+=hist[k];if(!wB)continue;const wF=n-wB;if(!wF)break;sB+=k*hist[k];const mB=sB/wB,mF=(sum-sB)/wF,v=wB*wF*(mB-mF)**2;if(v>best){best=v;bt=k}}
+  return mn+(bt+1)/B*(mx-mn)}
+function morph(m,w,h,dil){const o=new Uint8Array(m.length);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){let v=dil?0:1;
+    for(let dy=-1;dy<=1&&(dil?!v:v);dy++)for(let dx=-1;dx<=1;dx++){const xx=x+dx,yy=y+dy;const val=(xx>=0&&yy>=0&&xx<w&&yy<h)?m[yy*w+xx]:(dil?0:1);if(dil&&val){v=1;break}if(!dil&&!val){v=0;break}}
+    o[y*w+x]=v}return o}
+function label(m,w,h){const lab=new Int32Array(w*h).fill(-1),comps=[],st=new Int32Array(w*h);
+  for(let i=0;i<w*h;i++){if(!m[i]||lab[i]>=0)continue;const id=comps.length;let sp=0;st[sp++]=i;lab[i]=id;
+    const c={area:0,x0:w,y0:h,x1:0,y1:0,border:false,idx:[]};
+    while(sp){const p=st[--sp],x=p%w,y=(p-x)/w;c.area++;c.idx.push(p);if(x<c.x0)c.x0=x;if(x>c.x1)c.x1=x;if(y<c.y0)c.y0=y;if(y>c.y1)c.y1=y;
+      if(x===0||y===0||x===w-1||y===h-1)c.border=true;
+      if(x>0&&m[p-1]&&lab[p-1]<0){lab[p-1]=id;st[sp++]=p-1}
+      if(x<w-1&&m[p+1]&&lab[p+1]<0){lab[p+1]=id;st[sp++]=p+1}
+      if(y>0&&m[p-w]&&lab[p-w]<0){lab[p-w]=id;st[sp++]=p-w}
+      if(y<h-1&&m[p+w]&&lab[p+w]<0){lab[p+w]=id;st[sp++]=p+w}}
+    comps.push(c)}
+  return comps}
+function looksHistology(px){let n=0;for(let i=0;i<px.N;i++)if(px.G[i]<px.R[i]-4&&px.G[i]<px.B[i]-4&&px.L[i]>90)n++;
+  let bright=0;for(let i=0;i<px.N;i++)if(px.L[i]>190)bright++;
+  return n/px.N>.3&&bright/px.N>.08}
+function fullCanvas(){const c=document.createElement('canvas');c.width=imgEl.naturalWidth;c.height=imgEl.naturalHeight;const x=c.getContext('2d');x.drawImage(imgEl,0,0);return[c,x]}
+
+
+
+/* ---------- Lesion estimation ---------- */
+let base=null,dets=[],sel=0,frame=null;
+const sm=(x,a,b)=>clamp((x-a)/(b-a));
+function softmax(o){const k=Object.keys(o),m=Math.max(...k.map(x=>o[x])),e=k.map(x=>Math.exp(o[x]-m)),t=e.reduce((a,b)=>a+b);const r={};k.forEach((x,i)=>r[x]=e[i]/t);return r}
+function runLesion(px){
+  const{w,h,N,R,G,B,L}=px;
+  let valid=new Uint8Array(N),vc=0;for(let i=0;i<N;i++)valid[i]=(L[i]>28&&L[i]<240)?1:0;
+  valid=morph(morph(valid,w,h,false),w,h,false);for(let i=0;i<N;i++)vc+=valid[i];
+  if(vc<N*.15)return{error:'Image is too dark or blown-out to analyze.'};
+  let mcr=0,mcb=0,mL=0;const cr=new Float32Array(N),cb=new Float32Array(N);
+  for(let i=0;i<N;i++)if(valid[i]){cr[i]=(R[i]-G[i])/(L[i]+20);cb[i]=((R[i]+G[i])/2-B[i])/(L[i]+20);mcr+=cr[i];mcb+=cb[i];mL+=L[i]}
+  mcr/=vc;mcb/=vc;mL/=vc;
+  for(let i=0;i<N;i++)if(!valid[i]){cr[i]=mcr;cb[i]=mcb}
+  const crS=blur(cr,w,h,2),cbS=blur(cb,w,h,2),crL=blur(cr,w,h,18),cbL=blur(cb,w,h,18);
+  let sal=new Float32Array(N);
+  for(let i=0;i<N;i++)if(valid[i]){const loc=Math.hypot(crS[i]-crL[i],cbS[i]-cbL[i])*100,glo=Math.hypot(crS[i]-mcr,cbS[i]-mcb)*100;sal[i]=.5*loc+.5*glo}
+  sal=blur(sal,w,h,3);
+  let mean=0;for(let i=0;i<N;i++)if(valid[i])mean+=sal[i];mean/=vc;let sd=0;for(let i=0;i<N;i++)if(valid[i])sd+=(sal[i]-mean)**2;sd=Math.sqrt(sd/vc)+1e-6;
+  const thr=otsu(sal,valid);
+  let mask=new Uint8Array(N);for(let i=0;i<N;i++)mask[i]=valid[i]&&sal[i]>thr?1:0;
+  mask=morph(morph(mask,w,h,false),w,h,true);mask=morph(morph(mask,w,h,true),w,h,false);
+  // field geometry
+  let fx0=w,fx1=0,fy0=h,fy1=0;for(let i=0;i<N;i++)if(valid[i]){const x=i%w,y=(i/w)|0;if(x<fx0)fx0=x;if(x>fx1)fx1=x;if(y<fy0)fy0=y;if(y>fy1)fy1=y}
+  const fcx=(fx0+fx1)/2,fcy=(fy0+fy1)/2,fd=Math.hypot(fx1-fx0,fy1-fy0)/2+1;
+  const hp=new Float32Array(N),Lb=blur(L,w,h,2);for(let i=0;i<N;i++)hp[i]=L[i]-Lb[i];
+  const cands=label(mask,w,h).filter(c=>c.area/vc>.02&&c.area/vc<.55).map(c=>{
+    const m=new Uint8Array(N);for(const p of c.idx)m[p]=1;
+    let per=0;for(const p of c.idx){const x=p%w,y=(p/w)|0;if(x===0||y===0||x===w-1||y===h-1||!m[p-1]||!m[p+1]||!m[p-w]||!m[p+w])per++}
+    let ring=m;for(let k=0;k<5;k++)ring=morph(ring,w,h,true);
+    let iL=0,iR=0,ih=0,ms=0,oL=0,oR=0,on=0,cx=0,cy=0,mR=0,mG=0,mB=0,pl=0;
+    for(const p of c.idx){mR+=R[p];mG+=G[p];mB+=B[p];{const mx=Math.max(R[p],G[p],B[p]),mn=Math.min(R[p],G[p],B[p]);if(L[p]>170&&mx-mn<.3*mx)pl++}iL+=L[p];iR+=cr[p];ih+=hp[p]*hp[p];ms+=sal[p];cx+=p%w;cy+=(p/w)|0}
+    for(let i=0;i<N;i++)if(ring[i]&&!m[i]&&valid[i]){oL+=L[i];oR+=cr[i];on++}
+    const n=c.area;iL/=n;iR/=n;cx/=n;cy/=n;ms/=n;on=on||1;
+    return{c,iL,rr:mR/(mG+mB+1),sat:1-Math.min(mR,mG,mB)/(Math.max(mR,mG,mB)+1),pale:pl/n,gb:((mG+mB)/2/n-mR/n)/255,area:n/vc,circ:clamp(4*Math.PI*n/(per*per+1)),lumRatio:iL/(oL/on+1e-6),dRed:(iR-oR/on)*100,tex:Math.sqrt(ih/n),
+      contrast:(ms-thr)/sd,cdist:Math.hypot(cx-fcx,cy-fcy)/fd,score:ms*Math.sqrt(n)}}).sort((a,b)=>b.score-a.score).filter(d=>d.contrast>=1.2).slice(0,3);
+  cands.forEach((d,i)=>{d.n=i+1;
+    d.conf=clamp(.3+.6*(1-Math.exp(-d.contrast/1.2)),.25,.85);
+    const dome=sm(d.lumRatio,1,1.25);
+    d.cls=softmax({polyp:1.2*d.circ+dome+.8*sm(d.area,.03,.15)*(1-sm(d.area,.4,.55))+.4*(1-d.pale)-.5*sm(d.rr,1.3,1.7),
+     ulcer:1.4*sm(d.pale,.1,.4)+.6*(1-d.circ)+.5*sm(d.area,.03,.2)+.3*sm(d.dRed,2,10),
+     erosion:(1-sm(d.area,.02,.08))+.7*sm(d.pale,.05,.25)+.5*(1-d.circ)+.4*sm(d.dRed,0,8),
+     erythema:sm(d.area,.08,.3)+(1-sm(d.contrast,.3,1.5))+.9*sm(d.dRed,2,10)-.5*sm(d.rr,1.35,1.7),
+     angiectasia:1.4*(1-sm(d.area,.02,.06))+1.2*sm(d.dRed,8,20)+.6*sm(d.rr,1.15,1.5),
+     blood_fresh:1.6*sm(d.rr,1.3,1.8)+.8*sm(d.sat,.45,.75)+.5*sm(d.area,.03,.15),
+     blood_hematin:1.4*(1-sm(d.iL,40,100))+.5*(1-sm(d.sat,.3,.6))+.4*sm(d.rr,.9,1.3),
+     foreign_body:1.5*sm(d.gb,-.02,.12)+.6*sm(d.circ,.6,.9)*(1-sm(d.dRed,0,6)),
+     lymphangiectasia:1.3*sm(d.pale,.15,.5)+(1-sm(d.area,.03,.1))+.6*(1-sm(d.dRed,0,6))+.4*sm(d.iL,150,210)});
+    d.hotspot=d.lumRatio>1.25&&d.tex<3.2&&d.cdist<.35;
+    d.size=d.area<.08?'Small':d.area<.25?'Medium':'Large';
+    const S=px.scale,pad=2;d.box=[Math.max(0,d.c.x0-pad)*S,Math.max(0,d.c.y0-pad)*S,Math.min(w,d.c.x1+pad)*S,Math.min(h,d.c.y1+pad)*S];
+  });
+  let spec=0,shp=0,cN=0,cS=0,aN=0,aS=0;
+  for(let i=0;i<N;i++){if(!valid[i])continue;if(L[i]>232)spec++;shp+=Math.abs(hp[i]);const x=i%w,y=(i/w)|0,dd=Math.hypot(x-fcx,y-fcy)/fd;if(dd<.2){cS+=L[i];cN++}else if(dd>.4&&dd<.75){aS+=L[i];aN++}}
+  const specF=spec/vc,sharp=shp/vc,ctr=(cN&&aN)?(cS/cN)/(aS/aN+1):1,les=cands.reduce((m,d)=>Math.max(m,d.conf*sm(d.contrast,.4,1.6)),0);
+  frame=softmax({lesion_finding:2.4*les,normal_clean_mucosa:1.4*(1-les)+.6*sm(mL,80,140)+.4*(1-sm(specF,.02,.08)),reduced_mucosal_view:1.4*(1-sm(mL,45,85))+1.2*sm(specF,.02,.08)+(1-sm(sharp,1,2.5)),pylorus:1.3*(1-sm(ctr,.35,.7))*(1-.5*les),ileocecal_valve:.4*(1-sm(ctr,.5,.9))-.2,ampulla_of_vater:-.9});
+  dets=cands;sel=0;
+  return{dets:cands,frame,base:fullCanvas()[0],isHist:looksHistology(px)};
+}
+const NAMES={G1:'Well differentiated',G2:'Moderately differentiated',G3:'Poorly differentiated'};
+function inv3(m){const[a,b,c,d,e,f,g,h,i]=m.flat(),A=e*i-f*h,B=-(d*i-f*g),C=d*h-e*g,D=-(b*i-c*h),E=a*i-c*g,F=-(a*h-b*g),G=b*f-c*e,H=-(a*f-c*d),I=a*e-b*d,det=a*A+b*B+c*C;return[[A,D,G],[B,E,H],[C,F,I]].map(r=>r.map(v=>v/det))}
+const STAIN=(()=>{const M=[[.65,.704,.286],[.072,.99,.105],[.268,.57,.776]].map(r=>{const n=Math.hypot(...r);return r.map(v=>v/n)});return inv3(M)})();
+function runGrade(px){
+  const{w,h,N,R,G,B,L}=px;
+  const bright=new Uint8Array(N);for(let i=0;i<N;i++){const mx=Math.max(R[i],G[i],B[i]),mn=Math.min(R[i],G[i],B[i]);bright[i]=L[i]>195&&mx-mn<50?1:0}
+  const clean=morph(morph(bright,w,h,false),w,h,true);let bp=0;for(let i=0;i<N;i++)bp+=clean[i];
+  const tissue=N-bp;
+  if(tissue<N*.25)return{error:'Too little tissue visible (mostly blank background). Use a patch that is mainly tissue.'};
+  // colour deconvolution -> haematoxylin (nuclei) concentration
+  const Hc=new Float32Array(N);
+  for(let i=0;i<N;i++){const od=[R[i],G[i],B[i]].map(v=>-Math.log10(Math.max(v,1)/255));Hc[i]=Math.max(0,od[0]*STAIN[0][0]+od[1]*STAIN[1][0]+od[2]*STAIN[2][0])}
+  const Hs=blur(Hc,w,h,1),tis=new Uint8Array(N);for(let i=0;i<N;i++)tis[i]=clean[i]?0:1;
+  const th=otsu(Hs,tis);let nuc=new Uint8Array(N);for(let i=0;i<N;i++)nuc[i]=tis[i]&&Hs[i]>th?1:0;
+  nuc=morph(morph(nuc,w,h,false),w,h,true);
+  const nc=label(nuc,w,h).filter(c=>c.area>=3&&c.area<.01*N);
+  let nA=0;for(const c of nc)nA+=c.area;const mA=nA/(nc.length||1);let vA=0;for(const c of nc)vA+=(c.area-mA)**2;
+  const nucFrac=nA/tissue,nucCV=nc.length?Math.sqrt(vA/nc.length)/mA:0;
+  // gland-like lumina: enclosed bright spaces lined by nuclei
+  const lumAll=label(clean,w,h).filter(c=>!c.border&&c.area>=.0008*N&&c.area<=.2*N);
+  const mark=new Int32Array(N),ringM=new Int32Array(N),glands=[];
+  lumAll.forEach((c,k)=>{for(const p of c.idx)mark[p]=k+1;let rc=0,rn=0,per=0;
+    for(const p of c.idx){const x=p%w,y=(p/w)|0;if(x<3||y<3||x>w-4||y>h-4)continue;
+      if(mark[p-1]!==k+1||mark[p+1]!==k+1||mark[p-w]!==k+1||mark[p+w]!==k+1)per++;
+      for(let dy=-3;dy<=3;dy++)for(let dx=-3;dx<=3;dx++){const q=p+dy*w+dx;if(mark[q]!==k+1&&ringM[q]!==k+1){ringM[q]=k+1;rc++;if(nuc[q])rn++}}}
+    if(rc&&rn/rc>=.15){c.circ=clamp(4*Math.PI*c.area/(per*per+1));glands.push(c)}});
+  let lumPx=0;for(const c of glands)lumPx+=c.area;
+  const cnt=glands.length,lumFrac=lumPx/(tissue+lumPx),dens=cnt/(N/10000),meanCirc=cnt?glands.reduce((a,c)=>a+c.circ,0)/cnt:0;
+  const gs=clamp(.45*sm(lumFrac,.015,.12)+.3*sm(dens,.4,3)+.25*meanCirc*sm(cnt,2,6));
+  const p=softmax({G1:2.4*gs+.6*meanCirc*(cnt>=4?1:0)-sm(nucFrac,.35,.6),G2:1.5-Math.abs(gs-.45)*3.6,G3:2.2*(1-gs)+sm(nucFrac,.25,.5)+.6*sm(nucCV,.5,1)});
+  const grade=Object.keys(p).sort((a,b)=>p[b]-p[a])[0];
+  // overlay: gland lumina (teal) + nuclear-density heat (red)
+  const nf=new Float32Array(N);for(let i=0;i<N;i++)nf[i]=nuc[i];const heat=blur(nf,w,h,7);let hm=0;for(let i=0;i<N;i++)if(tis[i])hm=Math.max(hm,heat[i]);
+  const [cv,ctx]=fullCanvas(),ov=document.createElement('canvas');ov.width=w;ov.height=h;const ox=ov.getContext('2d'),id=ox.createImageData(w,h);
+  for(let i=0;i<N;i++)if(tis[i]&&hm>0){id.data[i*4]=230;id.data[i*4+1]=70;id.data[i*4+2]=60;id.data[i*4+3]=Math.round(110*heat[i]/hm)}
+  for(const c of glands)for(const q of c.idx){id.data[q*4]=15;id.data[q*4+1]=210;id.data[q*4+2]=190;id.data[q*4+3]=170}
+  ox.putImageData(id,0,0);ctx.imageSmoothingEnabled=true;ctx.drawImage(ov,0,0,cv.width,cv.height);
+  return{canvas:cv,grade,p,cnt,meanCirc,lumFrac,nucFrac,nucCV,isHist:looksHistology(px)};
+}
+
+
+function tooSmall(img){return img.naturalWidth<48||img.naturalHeight<48}
+function analyzeLesion(img){if(tooSmall(img))return{error:'Image is too small (minimum 48 px).'};imgEl=img;return runLesion(getPixels(img))}
+function analyzeGrade(img){if(tooSmall(img))return{error:'Image is too small (minimum 48 px).'};imgEl=img;return runGrade(getPixels(img))}
+
+/* ================= React UI ================= */
+const {useState,useEffect,useRef}=React;
+const html=htm.bind(React.createElement);
+const cx=(...a)=>a.filter(Boolean).join(' ');
+const pretty=k=>{const t=k.replace(/_/g,' ');return t[0].toUpperCase()+t.slice(1)};
+const topKey=o=>Object.keys(o).sort((a,b)=>o[b]-o[a])[0];
+const GRADE={G1:{name:'Well differentiated',hex:'#10b981'},G2:{name:'Moderately differentiated',hex:'#f59e0b'},G3:{name:'Poorly differentiated',hex:'#ef4444'}};
+
+const ic=d=>({className='h-5 w-5'})=>html`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className=${className} aria-hidden="true" dangerouslySetInnerHTML=${{__html:d}}></svg>`;
+const Sun=ic('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>');
+const Moon=ic('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>');
+const Upload=ic('<path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/>');
+const Scan=ic('<path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><path d="M4 12h16"/>');
+const Alert=ic('<path d="M12 3l10 18H2L12 3z"/><path d="M12 10v5M12 18h.01"/>');
+const Lock=ic('<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>');
+const Target=ic('<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 1v3M12 20v3M1 12h3M20 12h3"/>');
+const Micro=ic('<path d="M6 18h8M3 22h18M14 22a7 7 0 0 0 0-14h-1M9 14h2"/><path d="M9 12a2 2 0 0 1-2-2V6h6v4a2 2 0 0 1-2 2z"/><path d="M12 6V3a1 1 0 0 0-1-1H9a1 1 0 0 0-1 1v3"/>');
+const Img=ic('<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="M21 15l-5-5L5 21"/>');
+const X=ic('<path d="M18 6L6 18M6 6l12 12"/>');
+const Layers=ic('<path d="M12 2l10 5-10 5L2 7l10-5z"/><path d="M2 12l10 5 10-5M2 17l10 5 10-5"/>');
+
+const Card=({className,children})=>html`<div className=${cx('rounded-2xl border border-slate-200/80 bg-white/80 shadow-sm shadow-slate-200/50 backdrop-blur dark:border-slate-800 dark:bg-slate-900/70 dark:shadow-none',className)}>${children}</div>`;
+const Lbl=({children})=>html`<div className="mb-3 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500 dark:text-slate-400">${children}</div>`;
+const Warn=({children})=>html`<div className="flex gap-2.5 rounded-xl border border-amber-300/60 bg-amber-50 px-3.5 py-2.5 text-sm text-amber-800 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-300"><${Alert} className="mt-0.5 h-4 w-4 shrink-0"/><div>${children}</div></div>`;
+
+function Bars({data,colors}){
+  const [on,setOn]=useState(false);
+  useEffect(()=>{const t=setTimeout(()=>setOn(true),40);return()=>clearTimeout(t)},[]);
+  const keys=Object.keys(data).sort((a,b)=>data[b]-data[a]);
+  return html`<div className="space-y-3">${keys.map((k,i)=>html`
+    <div key=${k} className="grid grid-cols-[minmax(0,9.5rem)_1fr_2.75rem] items-center gap-3 text-sm">
+      <span className=${cx('truncate',i===0?'font-semibold text-slate-900 dark:text-white':'text-slate-500 dark:text-slate-400')}>${pretty(k)}</span>
+      <div className="h-2.5 overflow-hidden rounded-full bg-slate-200/80 dark:bg-slate-800">
+        <div className=${cx('h-full rounded-full transition-all duration-700 ease-out',!colors&&(i===0?'bg-gradient-to-r from-emerald-400 to-cyan-500':'bg-slate-400/70 dark:bg-slate-600'))} style=${{width:on?data[k]*100+'%':'0%',background:colors?colors[k]:undefined,opacity:colors&&i>0?.55:1}}></div>
+      </div>
+      <span className="text-right tabular-nums text-slate-500 dark:text-slate-400">${Math.round(data[k]*100)}%</span>
+    </div>`)}</div>`;
+}
+
+function Ring({value,color,children}){
+  const r=38,c=2*Math.PI*r,[on,setOn]=useState(false);
+  useEffect(()=>{const t=setTimeout(()=>setOn(true),60);return()=>clearTimeout(t)},[]);
+  return html`<div className="relative h-24 w-24 shrink-0">
+    <svg viewBox="0 0 100 100" className="h-full w-full -rotate-90">
+      <circle cx="50" cy="50" r=${r} fill="none" strokeWidth="9" className="stroke-slate-200 dark:stroke-slate-800"/>
+      <circle cx="50" cy="50" r=${r} fill="none" strokeWidth="9" strokeLinecap="round" stroke=${color} strokeDasharray=${(on?c*value:0)+' '+c} style=${{transition:'stroke-dasharray .9s ease'}}/>
+    </svg>
+    <div className="absolute inset-0 flex items-center justify-center">${children}</div></div>`;
+}
+
+function CanvasView({base,dets,sel}){
+  const ref=useRef(null);
+  useEffect(()=>{
+    const cv=ref.current;if(!cv||!base)return;
+    cv.width=base.width;cv.height=base.height;
+    const x=cv.getContext('2d');x.drawImage(base,0,0);
+    if(!dets)return;
+    const lw=Math.max(3,Math.round(Math.max(cv.width,cv.height)/200)),fs=Math.max(14,Math.round(cv.width/38)),col='#10e0a0';
+    dets.forEach((d,i)=>{const[x0,y0,x1,y1]=d.box,on=i===sel;
+      x.globalAlpha=on?1:.5;x.strokeStyle=col;x.lineWidth=on?lw*1.5:lw;x.setLineDash(on?[]:[lw*3,lw*2]);x.strokeRect(x0,y0,x1-x0,y1-y0);x.setLineDash([]);
+      if(on){x.globalAlpha=.14;x.fillStyle=col;x.fillRect(x0,y0,x1-x0,y1-y0)}
+      x.globalAlpha=1;x.font='700 '+fs+'px sans-serif';const t='#'+d.n,tw=x.measureText(t).width+14;
+      x.fillStyle=col;x.fillRect(x0,Math.max(0,y0-fs-8),tw,fs+8);x.fillStyle='#04120c';x.fillText(t,x0+7,Math.max(fs,y0-8))});
+  },[base,dets,sel]);
+  return html`<canvas ref=${ref} className="mx-auto block h-auto max-h-[28rem] w-auto max-w-full rounded-xl bg-slate-100 dark:bg-slate-950"></canvas>`;
+}
+
+function Dropzone({st,mode,onFile,onClear}){
+  const [over,setOver]=useState(false),inp=useRef(null),busy=st.status==='working';
+  const drop=e=>{e.preventDefault();setOver(false);const f=e.dataTransfer.files&&e.dataTransfer.files[0];if(f)onFile(f)};
+  return html`<div>
+    <input ref=${inp} type="file" accept="image/png,image/jpeg,image/webp,image/bmp" className="hidden" onChange=${e=>{const f=e.target.files[0];if(f)onFile(f);e.target.value=''}}/>
+    <div role="button" tabIndex="0" aria-label="Upload an image"
+      onClick=${()=>!st.url&&inp.current.click()} onKeyDown=${e=>{if((e.key==='Enter'||e.key===' ')&&!st.url){e.preventDefault();inp.current.click()}}}
+      onDragOver=${e=>{e.preventDefault();setOver(true)}} onDragLeave=${()=>setOver(false)} onDrop=${drop}
+      className=${cx('relative flex min-h-[18rem] items-center justify-center overflow-hidden rounded-xl border-2 border-dashed transition',over?'border-emerald-400 bg-emerald-50 dark:bg-emerald-500/10':'border-slate-300 bg-slate-50 hover:border-emerald-400 dark:border-slate-700 dark:bg-slate-900/60',!st.url&&'cursor-pointer')}>
+      ${st.url?html`<img src=${st.url} alt="Uploaded preview" className="max-h-[26rem] w-full object-contain"/>`:html`
+        <div className="px-6 py-10 text-center">
+          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400/20 to-cyan-500/20 text-emerald-600 dark:text-emerald-300"><${Upload} className="h-7 w-7"/></div>
+          <p className="font-semibold">Drop ${mode==='lesion'?'an endoscopy frame':'a histology patch'} here</p>
+          <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">or click to browse · JPEG, PNG, WebP</p>
+        </div>`}
+      ${busy&&html`<div className="pointer-events-none absolute inset-0"><div className="scanline absolute inset-x-0 h-1/3 bg-gradient-to-b from-transparent via-emerald-400/40 to-transparent"></div></div>`}
+      ${st.url&&!busy&&html`<button onClick=${e=>{e.stopPropagation();onClear()}} aria-label="Remove image" className="absolute right-3 top-3 rounded-full bg-slate-900/70 p-1.5 text-white transition hover:bg-slate-900"><${X} className="h-4 w-4"/></button>`}
+    </div>
+    ${st.error&&html`<div className="mt-3"><${Warn}>${st.error}<//></div>`}
+  </div>`;
+}
+
+/* ---------- Lesion views ---------- */
+function LesionShow({res,sel,onSel}){
+  return html`<div className="fade-up">
+    ${res.isHist&&html`<div className="mb-3"><${Warn}>This looks like a histology image, not an endoscopy frame. Results are probably meaningless.<//></div>`}
+    <${CanvasView} base=${res.base} dets=${res.dets} sel=${sel}/>
+    <div className="mt-4 flex flex-wrap items-center gap-2">
+      ${res.dets.length?res.dets.map((d,i)=>html`<button key=${d.n} onClick=${()=>onSel(i)} aria-pressed=${i===sel} className=${cx('rounded-full border px-3.5 py-1.5 text-sm font-medium transition',i===sel?'border-emerald-500 bg-emerald-500 text-white shadow shadow-emerald-500/30':'border-slate-300 bg-white text-slate-700 hover:border-emerald-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200')}>Region #${d.n} · ${Math.round(d.conf*100)}%</button>`):html`<p className="text-sm text-slate-500 dark:text-slate-400"><b className="text-slate-800 dark:text-slate-100">No clear finding.</b> Try a sharper, well-lit frame.</p>`}
+    </div></div>`;
+}
+function LesionDetails({res,sel}){
+  const f=res.frame,d=res.dets[sel];
+  const frameCard=html`<${Card} className="p-5"><${Lbl}>Frame assessment<//><div className="text-2xl font-bold tracking-tight">${pretty(topKey(f))}</div><p className="mb-4 mt-1 text-sm text-slate-500 dark:text-slate-400">Overall reading of this frame</p><${Bars} data=${f}/><//>`;
+  if(!d)return html`<div className="fade-up grid gap-4 md:grid-cols-2">${frameCard}<${Card} className="p-5"><${Lbl}>Finding type<//><p className="text-sm text-slate-500 dark:text-slate-400">No localized finding to classify.</p><//></div>`;
+  const why=[d.size+' region ('+(d.area*100).toFixed(0)+'% of the visible field)',
+    d.circ>.7?'rounded, well-circumscribed outline':d.circ>.45?'moderately irregular outline':'irregular, spread-out outline',
+    d.lumRatio>1.08?'brighter, dome-like shading vs. surroundings':d.lumRatio<.95?'darker than surroundings':'similar brightness to surroundings',
+    d.rr>1.3?'strongly red / saturated colour':d.dRed>10?'noticeably redder than surrounding mucosa':d.dRed>3?'mildly redder than surrounding mucosa':'similar or paler colour than surroundings',
+    d.pale>.25?'whitish / pale areas present ('+Math.round(d.pale*100)+'% of region)':'little pale or whitish material',
+    d.tex>=6?'coarse surface texture':d.tex<3.5?'smooth surface':'moderate surface texture'];
+  return html`<div className="fade-up space-y-4">
+    <div className="grid gap-4 md:grid-cols-2">
+      ${frameCard}
+      <${Card} key=${sel} className="p-5"><${Lbl}>Finding type · region #${d.n}<//><div className="text-2xl font-bold tracking-tight">${pretty(topKey(d.cls))}</div><p className="mb-4 mt-1 text-sm text-slate-500 dark:text-slate-400">${d.size} region · detection score ${Math.round(d.conf*100)}%</p><${Bars} data=${d.cls}/><//>
+    </div>
+    <${Card} className="p-5"><${Lbl}>Why this estimate<//>
+      <ul className="grid gap-x-8 gap-y-2 text-sm text-slate-600 sm:grid-cols-2 dark:text-slate-300">${why.map(w=>html`<li key=${w} className="flex gap-2"><span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500"></span>${w}</li>`)}</ul>
+      ${d.hotspot&&html`<div className="mt-4"><${Warn}>This region is very bright, smooth and central. It may be the endoscope light hotspot rather than a real finding.<//></div>`}
+    <//></div>`;
+}
+
+/* ---------- Grading views ---------- */
+function GradeShow({res}){
+  const host=useRef(null);
+  useEffect(()=>{const c=res.canvas;c.className='mx-auto block h-auto max-h-[28rem] w-auto max-w-full rounded-xl';host.current.replaceChildren(c)},[res]);
+  return html`<div className="fade-up">
+    ${!res.isHist&&html`<div className="mb-3"><${Warn}>This does not look like an H&E histology image (pink/purple stain). The estimate may be meaningless.<//></div>`}
+    <div ref=${host}></div>
+    <div className="mt-3 flex flex-wrap gap-4 text-xs text-slate-500 dark:text-slate-400"><span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-sm bg-teal-400"></i>Gland-like spaces</span><span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-sm bg-red-500/70"></i>Nuclear density</span></div></div>`;
+}
+const Tile=({label,value})=>html`<div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-900"><div className="text-xl font-bold tabular-nums">${value}</div><div className="text-xs text-slate-500 dark:text-slate-400">${label}</div></div>`;
+function GradeDetails({res}){
+  const g=res.grade,info=GRADE[g],p=res.p,colors={G1:GRADE.G1.hex,G2:GRADE.G2.hex,G3:GRADE.G3.hex};
+  const why={G1:'Numerous gland-like spaces lined by nuclei with regular, rounded shapes: consistent with well-formed glands.',G2:'Some gland-like spaces are present but sparse or irregular, with partial solid areas: consistent with moderate gland formation.',G3:'Few or no nuclei-lined gland spaces; tissue is solid and cell-dense with variable nuclear size: consistent with loss of gland formation.'}[g];
+  return html`<div className="fade-up space-y-4">
+    <div className="grid gap-4 md:grid-cols-2">
+      <${Card} className="p-5"><${Lbl}>Estimated grade<//>
+        <div className="flex items-center gap-5">
+          <${Ring} value=${p[g]} color=${info.hex}><span className="text-3xl font-extrabold" style=${{color:info.hex}}>${g}</span><//>
+          <div><div className="text-xl font-bold tracking-tight">${info.name}</div><div className="mt-1 text-sm text-slate-500 dark:text-slate-400">${Math.round(p[g]*100)}% heuristic score</div></div>
+        </div>
+        <div className="mt-5"><${Bars} data=${p} colors=${colors}/></div>
+      <//>
+      <${Card} className="p-5"><${Lbl}>Measured features<//>
+        <div className="grid grid-cols-2 gap-3"><${Tile} label="Gland-like spaces" value=${res.cnt}/><${Tile} label="Gland shape regularity" value=${Math.round(res.meanCirc*100)+'%'}/><${Tile} label="Open space" value=${(res.lumFrac*100).toFixed(1)+'%'}/><${Tile} label="Nuclei (of tissue)" value=${Math.round(res.nucFrac*100)+'%'}/></div>
+        <p className="mt-4 text-sm text-slate-600 dark:text-slate-300">${why}</p>
+        <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">Nuclear size variation: ${res.nucCV.toFixed(2)}</p>
+      <//>
+    </div></div>`;
+}
+
+/* ---------- App ---------- */
+const initSess=()=>({status:'idle',file:null,img:null,url:null,error:null,result:null,sel:0});
+function App(){
+  const [theme,setTheme]=useState(()=>document.documentElement.classList.contains('dark')?'dark':'light');
+  const [mode,setMode]=useState('lesion');
+  const [S,setS]=useState({lesion:initSess(),grade:initSess()});
+  const st=S[mode];
+  const patch=(m,p)=>setS(s=>({...s,[m]:{...s[m],...p}}));
+  const toggle=()=>{const n=theme==='dark'?'light':'dark';setTheme(n);document.documentElement.classList.toggle('dark',n==='dark');document.documentElement.dataset.theme=n;try{localStorage.setItem('crc-theme',n)}catch(e){}};
+  const onFile=f=>{
+    const m=mode;
+    if(!/^image\//.test(f.type)){patch(m,{error:'Please choose an image file (JPEG, PNG or WebP).'});return}
+    if(f.size>25*1024*1024){patch(m,{error:'That image is larger than 25 MB.'});return}
+    const url=URL.createObjectURL(f),img=new Image();
+    img.onload=()=>{if(S[m].url)URL.revokeObjectURL(S[m].url);patch(m,{file:f,img,url,status:'ready',result:null,error:null,sel:0})};
+    img.onerror=()=>{URL.revokeObjectURL(url);patch(m,{error:'That image could not be read. Try a different file.'})};
+    img.src=url;
+  };
+  const clear=()=>{if(st.url)URL.revokeObjectURL(st.url);patch(mode,initSess())};
+  const analyze=async()=>{
+    const m=mode,img=S[m].img;if(!img)return;
+    patch(m,{status:'working',error:null});
+    await new Promise(r=>setTimeout(r,350));
+    try{const res=m==='lesion'?analyzeLesion(img):analyzeGrade(img);
+      if(res.error)patch(m,{status:'ready',result:null,error:res.error});else patch(m,{status:'done',result:res,sel:0})}
+    catch(e){patch(m,{status:'ready',error:'Analysis failed: '+e.message})}
+  };
+  const tabs=[['lesion','Lesion Detection','Endoscopy frame → findings & type',Target],['grade','Cancer Grading','H&E patch → G1 / G2 / G3',Micro]];
+  const busy=st.status==='working',done=st.status==='done'&&st.result;
+  return html`<div className="relative min-h-screen overflow-x-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+    <div className="pointer-events-none absolute inset-0 -z-0 overflow-hidden" aria-hidden="true">
+      <div className="absolute -left-32 -top-32 h-[28rem] w-[28rem] rounded-full bg-emerald-400/20 blur-3xl dark:bg-emerald-500/10"></div>
+      <div className="absolute -right-32 top-24 h-[26rem] w-[26rem] rounded-full bg-cyan-400/20 blur-3xl dark:bg-indigo-500/10"></div>
+    </div>
+    <header className="sticky z-20 border-b border-slate-200/70 bg-white/70 backdrop-blur-xl dark:border-slate-800/70 dark:bg-slate-950/70" style=${{top:'env(safe-area-inset-top,0px)'}}>
+      <div className="mx-auto flex max-w-6xl items-center justify-between px-5 py-3">
+        <div className="flex items-center gap-3"><div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-emerald-400 to-cyan-500 text-white shadow-lg shadow-emerald-500/30"><${Scan} className="h-5 w-5"/></div>
+          <div className="leading-tight"><div className="font-bold tracking-tight">CRC Vision</div><div className="text-[11px] text-slate-500 dark:text-slate-400">Colorectal image estimator</div></div></div>
+        <button onClick=${toggle} aria-label=${theme==='dark'?'Switch to light mode':'Switch to dark mode'} title="Toggle theme" className="flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 transition hover:border-emerald-400 hover:text-emerald-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200">${theme==='dark'?html`<${Sun}/>`:html`<${Moon}/>`}</button>
+      </div></header>
+
+    <main className="relative z-10 mx-auto max-w-6xl px-5 pb-20 pt-10">
+      <section className="mb-8 max-w-2xl">
+        <h1 className="text-4xl font-extrabold leading-tight tracking-tight sm:text-5xl">Analyze colorectal images <span className="bg-gradient-to-r from-emerald-500 to-cyan-500 bg-clip-text text-transparent">in seconds</span></h1>
+        <p className="mt-4 text-lg text-slate-600 dark:text-slate-300">Locate and type lesions in endoscopy frames, or estimate the differentiation grade of a histology patch. Everything runs privately in your browser.</p>
+        <div className="mt-5 flex flex-wrap gap-2 text-xs font-medium">
+          <span className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 dark:border-slate-800 dark:bg-slate-900"><${Lock} className="h-3.5 w-3.5 text-emerald-500"/>Images never leave your device</span>
+          <span className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 dark:border-slate-800 dark:bg-slate-900"><${Layers} className="h-3.5 w-3.5 text-emerald-500"/>14 Kvasir-Capsule classes</span>
+          <span className="flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 dark:border-slate-800 dark:bg-slate-900"><${Micro} className="h-3.5 w-3.5 text-emerald-500"/>G1 · G2 · G3 grading</span>
+        </div>
+      </section>
+
+      <div className="mb-6"><${Warn}><b>Estimator, not a diagnostic tool.</b> Results come from image-analysis rules, not a trained or validated model, so accuracy is unmeasured and errors are expected. Never use for medical decisions.<//></div>
+
+      <div role="tablist" className="mb-6 grid gap-3 sm:grid-cols-2">${tabs.map(([k,t,sub,Ico])=>html`
+        <button key=${k} role="tab" aria-selected=${mode===k} onClick=${()=>setMode(k)} className=${cx('flex items-center gap-4 rounded-2xl border p-4 text-left transition',mode===k?'border-emerald-500 bg-white shadow-lg shadow-emerald-500/10 ring-1 ring-emerald-500 dark:bg-slate-900':'border-slate-200 bg-white/60 hover:border-emerald-400 dark:border-slate-800 dark:bg-slate-900/50')}>
+          <div className=${cx('flex h-11 w-11 shrink-0 items-center justify-center rounded-xl',mode===k?'bg-gradient-to-br from-emerald-400 to-cyan-500 text-white':'bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400')}><${Ico} className="h-6 w-6"/></div>
+          <div><div className="font-bold">${t}</div><div className="text-sm text-slate-500 dark:text-slate-400">${sub}</div></div></button>`)}</div>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        <${Card} className="p-5"><${Lbl}>${mode==='lesion'?'Endoscopy frame':'H&E histology patch'}<//>
+          <${Dropzone} key=${mode} st=${st} mode=${mode} onFile=${onFile} onClear=${clear}/>
+          <div className="mt-4 flex items-center justify-end gap-3">
+            ${st.url&&html`<button onClick=${()=>document.querySelector('input[type=file]').click()} disabled=${busy} className="rounded-xl px-4 py-2.5 text-sm font-medium text-slate-600 transition hover:text-emerald-600 disabled:opacity-40 dark:text-slate-300">Change image</button>`}
+            <button onClick=${analyze} disabled=${!st.img||busy} className="rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 px-6 py-2.5 text-sm font-semibold text-white shadow-lg shadow-emerald-500/25 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none">${busy?'Analyzing…':'Analyze'}</button>
+          </div>
+        <//>
+        <${Card} className="p-5"><${Lbl}>${mode==='lesion'?'Detection':'Grading'}<//>
+          ${done?(mode==='lesion'?html`<${LesionShow} res=${st.result} sel=${st.sel} onSel=${i=>patch('lesion',{sel:i})}/>`:html`<${GradeShow} res=${st.result}/>`)
+            :busy?html`<div className="flex min-h-[18rem] animate-pulse flex-col items-center justify-center gap-3 text-slate-400"><${Scan} className="h-10 w-10"/><span className="text-sm">Analyzing image…</span></div>`
+            :html`<div className="flex min-h-[18rem] flex-col items-center justify-center gap-3 text-center text-slate-400 dark:text-slate-500"><${Img} className="h-10 w-10"/><p className="max-w-xs text-sm">Upload an image and press <b>Analyze</b>. Results appear here.</p></div>`}
+        <//>
+      </div>
+
+      ${done&&html`<div className="mt-5" key=${mode}>${mode==='lesion'?html`<${LesionDetails} res=${st.result} sel=${st.sel}/>`:html`<${GradeDetails} res=${st.result}/>`}</div>`}
+    </main>
+    <footer className="relative z-10 border-t border-slate-200/70 py-8 text-center text-xs text-slate-500 dark:border-slate-800/70 dark:text-slate-400"><div className="mx-auto max-w-3xl px-5">CRC Vision is a research demo built with React and Tailwind. Scores are rule-of-thumb estimates, not calibrated probabilities. A qualified clinician must confirm any finding.</div></footer>
+  </div>`;
+}
+
+class Boundary extends React.Component{
+  constructor(p){super(p);this.state={err:null}}
+  static getDerivedStateFromError(e){return{err:e}}
+  render(){return this.state.err?html`<div className="p-10 text-center"><h1 className="text-xl font-bold">Something went wrong</h1><p className="mt-2 text-slate-500">${String(this.state.err.message||this.state.err)}</p><button className="mt-4 rounded-lg bg-emerald-500 px-4 py-2 text-white" onClick=${()=>location.reload()}>Reload</button></div>`:this.props.children}
+}
+ReactDOM.createRoot(document.getElementById('root')).render(html`<${Boundary}><${App}/><//>`);
+
+})();
+</script>
+</body>
+</html>
